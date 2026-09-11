@@ -160,10 +160,11 @@ elements.credentialsForm = elements['credentials-form'];
 elements.credentialsForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   hideNotice();
-  const values = new FormData(event.currentTarget);
+  const form = event.currentTarget;
+  const values = new FormData(form);
   try {
     await api('/api/settings', { method: 'PUT', body: JSON.stringify({ clientId: values.get('clientId'), clientSecret: values.get('clientSecret') }) });
-    event.currentTarget.reset();
+    form.reset();
     await loadSettings();
     await refresh();
     showNotice('Credentials saved. Connect TIDAL to continue.');
