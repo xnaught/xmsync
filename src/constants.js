@@ -1,0 +1,13 @@
+export const HOST = '127.0.0.1';
+export const PORT = 8787;
+export const APP_URL = `http://localhost:${PORT}`;
+export const CALLBACK_URL = `${APP_URL}/auth/tidal/callback`;
+export const TIDAL_API_URL = 'https://openapi.tidal.com/v2';
+export const TIDAL_AUTH_URL = 'https://login.tidal.com/authorize';
+export const TIDAL_TOKEN_URL = 'https://auth.tidal.com/v1/oauth2/token';
+export const TIDAL_SCOPES = ['user.read', 'playlists.read', 'playlists.write', 'search.read'];
+export const XMPLAYLIST_URL = 'https://xmplaylist.com/api';
+export const USER_AGENT = 'xmsync/1.0 (+local personal playlist sync)';
+export const JSON_API = 'application/vnd.api+json';
+export const COUNTRY_CODE = 'US';
+export const IDEMPOTENCY_WINDOW_MS = 60 * 60 * 1000;

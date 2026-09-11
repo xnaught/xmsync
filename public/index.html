@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>xmsync</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <header class="masthead">
+    <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+    <div>
+      <p class="eyebrow">LOCAL AIRPLAY ARCHIVE</p>
+      <h1>XM<span>/</span>SYNC</h1>
+    </div>
+    <div class="signal" id="signal"><i></i><span>STOPPED</span></div>
+  </header>
+
+  <main>
+    <div class="notice hidden" id="notice" role="status"></div>
+
+    <section class="setup panel" aria-labelledby="setup-title">
+      <div class="section-heading">
+        <div>
+          <p class="step">01 / CONNECTION</p>
+          <h2 id="setup-title">TIDAL authorization</h2>
+        </div>
+        <span class="connection-pill" id="connection-state">Not connected</span>
+      </div>
+      <p class="muted">Register <code>http://localhost:8787/auth/tidal/callback</code> exactly in your TIDAL developer application.</p>
+      <form id="credentials-form" class="credentials">
+        <label>Client ID<input name="clientId" autocomplete="off" required placeholder="TIDAL client ID"></label>
+        <label>Client secret<input name="clientSecret" type="password" autocomplete="new-password" required placeholder="TIDAL client secret"></label>
+        <button type="submit" class="button secondary">Save credentials</button>
+      </form>
+      <div class="credential-state" id="credential-state">No credentials saved.</div>
+      <div class="button-row">
+        <a class="button primary" id="connect-button" href="/auth/tidal/start">Connect TIDAL</a>
+        <button class="button text" id="disconnect-button" type="button">Disconnect</button>
+        <button class="button text" id="smoke-button" type="button">Run feasibility test</button>
+      </div>
+      <div class="smoke-results hidden" id="smoke-results"></div>
+    </section>
+
+    <section class="panel channel-panel" aria-labelledby="channel-title">
+      <div class="section-heading">
+        <div>
+          <p class="step">02 / FREQUENCY</p>
+          <h2 id="channel-title">SiriusXM channel</h2>
+        </div>
+        <div class="channel-number" id="channel-number">CH --</div>
+      </div>
+      <div class="channel-picker">
+        <label for="channel-select">Visible channels</label>
+        <select id="channel-select" disabled><option value="">Loading channels...</option></select>
+        <button class="button secondary" id="select-channel" type="button" disabled>Select channel</button>
+      </div>
+      <p class="selected-channel" id="selected-channel">No channel selected</p>
+    </section>
+
+    <section class="control-deck panel" aria-labelledby="sync-title">
+      <div class="section-heading">
+        <div>
+          <p class="step">03 / RECORDER</p>
+          <h2 id="sync-title">Sync control</h2>
+        </div>
+        <div class="next-run"><span>NEXT RUN</span><strong id="next-run">--</strong></div>
+      </div>
+      <div class="transport">
+        <button class="transport-button start" id="start-button" type="button"><i></i><span>Start</span></button>
+        <button class="transport-button stop" id="stop-button" type="button"><i></i><span>Stop</span></button>
+        <button class="transport-button sync" id="sync-button" type="button"><i></i><span>Sync now</span></button>
+      </div>
+      <p class="last-run" id="last-run">No completed sync yet.</p>
+      <div class="meters" id="meters">
+        <div><strong data-count="fetched">0</strong><span>Fetched</span></div>
+        <div><strong data-count="alreadyProcessed">0</strong><span>Known</span></div>
+        <div><strong data-count="directMatched">0</strong><span>Direct</span></div>
+        <div><strong data-count="searchMatched">0</strong><span>Search</span></div>
+        <div><strong data-count="synced">0</strong><span>Synced</span></div>
+        <div><strong data-count="skipped">0</strong><span>Skipped</span></div>
+        <div><strong data-count="failed">0</strong><span>Failed</span></div>
+      </div>
+    </section>
+
+    <section class="runs panel" aria-labelledby="runs-title">
+      <div class="section-heading">
+        <div>
+          <p class="step">04 / LOGBOOK</p>
+          <h2 id="runs-title">Recent runs</h2>
+        </div>
+        <button class="button text" id="refresh-button" type="button">Refresh</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Time</th><th>Trigger</th><th>Status</th><th>Fetched</th><th>Synced</th><th>Skipped</th><th>Failed</th><th>Details</th></tr></thead>
+          <tbody id="runs-body"><tr><td colspan="8" class="empty">No runs recorded.</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer><span>xmsync runs only on this computer</span><span>US TIDAL catalog / append only</span></footer>
+</body>
+</html>

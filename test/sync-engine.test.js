@@ -1,0 +1,97 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { Database } from '../src/database.js';
+import { SyncEngine } from '../src/sync-engine.js';
+
+const channel = { id: 'station-1', deeplink: 'test', name: 'Test Radio', number: '42' };
+
+function rawPlay(id, timestamp) {
+  return {
+    id,
+    timestamp,
+    track: { id: 'xm-track', title: 'Dreams', artists: ['Fleetwood Mac'] },
+    links: [{ site: 'tidal', url: 'http://www.tidal.com/track/tidal-track' }],
+  };
+}
+
+function makeTidal() {
+  return {
+    creates: 0,
+    writes: [],
+    playlistContents: [],
+    async validateTrack(id) { return id; },
+    async searchTrack() { throw new Error('search should not be needed'); },
+    async allOwnedPlaylists() { return []; },
+    async createPlaylist() { this.creates += 1; return { data: { id: 'playlist-1' } }; },
+    async addPlaylistItems(id, items) {
+      this.writes.push({ id, items });
+      const added = items.map((item, index) => ({ type: 'tracks', id: item.trackId, meta: { itemId: `occurrence-${this.playlistContents.length + index}` } }));
+      this.playlistContents.push(...added);
+      return { data: added };
+    },
+    async playlistItems() { return this.playlistContents; },
+  };
+}
+
+test('distinct repeated airplays append as distinct ordered playlist occurrences and do not duplicate on retry', async () => {
+  const database = new Database(':memory:');
+  database.saveTokens({
+    userId: 'user', accessToken: 'a', refreshToken: 'r', tokenType: 'Bearer', scopes: [],
+    expiresAt: '2099-01-01T00:00:00.000Z', updatedAt: '2026-09-11T00:00:00.000Z',
+  });
+  const xm = { async page() {
+    return { results: [rawPlay('newer', '2026-09-11T12:10:00.000Z'), rawPlay('older', '2026-09-11T12:00:00.000Z')], next: null };
+  } };
+  const tidal = makeTidal();
+  const engine = new SyncEngine(database, xm, tidal, { clock: () => new Date('2026-09-11T13:00:00.000Z') });
+
+  const first = await engine.run('manual', channel);
+  assert.equal(first.status, 'completed');
+  assert.equal(first.counts.synced, 2);
+  assert.equal(tidal.creates, 1);
+  assert.deepEqual(tidal.writes[0].items, [{ trackId: 'tidal-track' }, { trackId: 'tidal-track' }]);
+  const rows = database.db.prepare('SELECT play_id, status, occurrence_id FROM plays ORDER BY airplay_at').all();
+  assert.deepEqual(rows.map((row) => row.play_id), ['older', 'newer']);
+  assert.deepEqual(rows.map((row) => row.occurrence_id), ['occurrence-0', 'occurrence-1']);
+
+  const second = await engine.run('manual', channel);
+  assert.equal(second.counts.alreadyProcessed, 2);
+  assert.equal(second.counts.synced, 0);
+  assert.equal(tidal.writes.length, 1);
+  database.close();
+});
+
+test('a date with no catalog match does not create a playlist', async () => {
+  const database = new Database(':memory:');
+  const xm = { async page() { return { results: [{
+    id: 'play', timestamp: '2026-09-11T12:00:00.000Z', track: { id: 'track', title: 'Missing', artists: ['Nobody'] }, links: [],
+  }], next: null }; } };
+  const tidal = makeTidal();
+  tidal.searchTrack = async () => null;
+  const engine = new SyncEngine(database, xm, tidal, { clock: () => new Date('2026-09-11T13:00:00.000Z') });
+  const result = await engine.run('manual', channel);
+  assert.equal(result.counts.skipped, 1);
+  assert.equal(tidal.creates, 0);
+  assert.equal(database.db.prepare('SELECT status FROM plays').get().status, 'skipped');
+  database.close();
+});
+
+test('failed pagination leaves the contiguous watermark unchanged', async () => {
+  const database = new Database(':memory:');
+  let calls = 0;
+  const xm = { async page() {
+    calls += 1;
+    if (calls === 2) throw Object.assign(new Error('page failed'), { code: 'XM_REQUEST_FAILED' });
+    return {
+      results: [rawPlay('play', '2026-09-11T12:00:00.000Z')],
+      next: 'http://xmplaylist.com/api/station/test?last=1789128000000',
+    };
+  } };
+  const tidal = makeTidal();
+  const engine = new SyncEngine(database, xm, tidal, { clock: () => new Date('2026-09-11T13:00:00.000Z') });
+  const result = await engine.run('schedule', channel);
+  assert.equal(result.status, 'partial');
+  assert.equal(database.getScanState(channel.id), undefined);
+  assert.equal(result.counts.synced, 1);
+  database.close();
+});

@@ -1,0 +1,16 @@
+{
+  "name": "xmsync",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Sync recent xmplaylist airplay to date-based TIDAL playlists",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "start:no-open": "node src/index.js --no-open",
+    "test": "node --test",
+    "tidal:smoke": "node scripts/tidal-smoke.js"
+  }
+}
