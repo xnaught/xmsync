@@ -1,8 +1,8 @@
-import { CALLBACK_URL, COUNTRY_CODE, JSON_API, TIDAL_API_URL, TIDAL_AUTH_URL, TIDAL_SCOPES, TIDAL_TOKEN_URL, USER_AGENT } from './constants.js';
+import { CALLBACK_URL, COUNTRY_CODE, JSON_API, TIDAL_API_URL, TIDAL_AUTH_URL, TIDAL_RATE_LIMIT_FALLBACK_MS, TIDAL_REQUEST_INTERVAL_MS, TIDAL_SCOPES, TIDAL_TOKEN_URL, USER_AGENT } from './constants.js';
 import { AppError } from './errors.js';
 import { rankCandidates } from './matching.js';
 import { fetchWithRetry, responseJson } from './request.js';
-import { nowIso, pkceChallenge, randomUrlToken } from './util.js';
+import { nowIso, parseRetryAfter, pkceChallenge, randomUrlToken, sleep } from './util.js';
 
 function errorMessage(body, fallback) {
   return body?.errors?.map((error) => error.detail ?? error.title ?? error.code).filter(Boolean).join('; ') || body?.error_description || body?.error || fallback;
@@ -49,7 +49,25 @@ export class TidalClient {
     this.apiUrl = options.apiUrl ?? TIDAL_API_URL;
     this.authUrl = options.authUrl ?? TIDAL_AUTH_URL;
     this.tokenUrl = options.tokenUrl ?? TIDAL_TOKEN_URL;
+    this.requestIntervalMs = options.requestIntervalMs ?? TIDAL_REQUEST_INTERVAL_MS;
+    this.sleepImpl = options.sleepImpl ?? sleep;
+    this.now = options.now ?? Date.now;
+    this.nextRequestAt = 0;
+    this.blockedUntil = 0;
     this.refreshPromise = null;
+  }
+
+  async paceRequest() {
+    const now = this.now();
+    if (now < this.blockedUntil) {
+      throw new AppError('TIDAL_RATE_LIMITED', 'TIDAL asked the app to wait before sending more requests. Retry later.', {
+        status: 429,
+        retryable: true,
+      });
+    }
+    const requestAt = Math.max(now, this.nextRequestAt);
+    this.nextRequestAt = requestAt + this.requestIntervalMs;
+    if (requestAt > now) await this.sleepImpl(requestAt - now);
   }
 
   authorizationUrl() {
@@ -183,20 +201,30 @@ export class TidalClient {
     try {
       response = await fetchWithRetry(url, { method: options.method ?? 'GET', headers, body: options.body }, {
         fetchImpl: this.fetchImpl,
+        sleepImpl: this.sleepImpl,
+        beforeAttempt: () => this.paceRequest(),
         attempts: options.mutation ? 1 : 3,
       });
     } catch (error) {
       if (options.mutation && error instanceof AppError) error.unsafeWrite = true;
       throw error;
     }
+    if (response.status === 429) {
+      const now = this.now();
+      const retryAfter = parseRetryAfter(response.headers.get('retry-after'), now) ?? TIDAL_RATE_LIMIT_FALLBACK_MS;
+      this.blockedUntil = Math.max(this.blockedUntil, now + retryAfter);
+    }
     let body;
     try {
       body = await responseJson(response, 'TIDAL');
     } catch (error) {
-      if (options.mutation && error instanceof AppError) error.unsafeWrite = true;
-      throw error;
+      if (!response.ok) body = null;
+      else {
+        if (options.mutation && error instanceof AppError) error.unsafeWrite = true;
+        throw error;
+      }
     }
-    if (response.status === 401 && options.retryAuth !== false && !options.accessToken) {
+    if (response.status === 401 && !options.mutation && options.retryAuth !== false && !options.accessToken) {
       await this.refresh();
       return this.request(pathOrUrl, { ...options, retryAuth: false });
     }

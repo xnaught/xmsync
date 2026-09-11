@@ -112,7 +112,7 @@ export class SyncEngine {
       this.database.addRunItem(runId, runItemFromPlay(play, 'failed', {
         errorCode: error.code ?? 'RESOLUTION_FAILED', errorMessage: error.message,
       }));
-      if (error.authRequired) throw error;
+      if (error.authRequired || error.status === 429) throw error;
       return null;
     }
   }
@@ -338,7 +338,7 @@ export class SyncEngine {
         } catch (error) {
           topError ??= error;
           playIds.forEach((id) => remaining.delete(id));
-          if (error.authRequired || error.unsafeWrite) {
+          if (error.authRequired || error.unsafeWrite || error.status === 429) {
             blockWrites = true;
             break;
           }
@@ -359,7 +359,7 @@ export class SyncEngine {
             this.database.setPlayOutcome(play.play_id, 'failed', { errorCode: error.code ?? 'PLAYLIST_FAILED', errorMessage: error.message }, nowIso());
             this.database.addRunItem(runId, runItemFromPlay(play, 'failed', { errorCode: error.code ?? 'PLAYLIST_FAILED', errorMessage: error.message }));
           }
-          if (error.authRequired || error.unsafeWrite) break;
+          if (error.authRequired || error.unsafeWrite || error.status === 429) break;
         }
       }
     } catch (error) {

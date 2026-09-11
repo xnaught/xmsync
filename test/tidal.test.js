@@ -65,3 +65,77 @@ test('an empty mutation response is classified as an unsafe write', async () => 
   });
   database.close();
 });
+
+test('TIDAL API requests are paced before reaching the network', async () => {
+  const database = new Database(':memory:');
+  database.saveTokens({
+    userId: 'user', accessToken: 'access', refreshToken: 'refresh', tokenType: 'Bearer',
+    scopes: [], expiresAt: '2099-01-01T00:00:00.000Z', updatedAt: new Date().toISOString(),
+  });
+  let now = 1_000;
+  const requestTimes = [];
+  const client = new TidalClient(database, {
+    now: () => now,
+    sleepImpl: async (ms) => { now += ms; },
+    fetchImpl: async () => {
+      requestTimes.push(now);
+      return Response.json({ data: { type: 'users', id: 'user' } });
+    },
+  });
+
+  await client.currentUser();
+  await client.currentUser();
+
+  assert.deepEqual(requestTimes, [1_000, 1_500]);
+  database.close();
+});
+
+test('a long Retry-After returns the 429 without retrying early', async () => {
+  const database = new Database(':memory:');
+  database.saveTokens({
+    userId: 'user', accessToken: 'access', refreshToken: 'refresh', tokenType: 'Bearer',
+    scopes: [], expiresAt: '2099-01-01T00:00:00.000Z', updatedAt: new Date().toISOString(),
+  });
+  let calls = 0;
+  const client = new TidalClient(database, {
+    requestIntervalMs: 0,
+    sleepImpl: async () => {},
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response('rate limited', { status: 429, headers: { 'Retry-After': '30' } });
+    },
+  });
+
+  await assert.rejects(client.currentUser(), (error) => {
+    assert.equal(error.status, 429);
+    assert.equal(error.retryable, true);
+    return true;
+  });
+  await assert.rejects(client.currentUser(), { code: 'TIDAL_RATE_LIMITED', status: 429 });
+  assert.equal(calls, 1);
+  database.close();
+});
+
+test('a rate-limited mutation gets exactly one network attempt', async () => {
+  const database = new Database(':memory:');
+  database.saveTokens({
+    userId: 'user', accessToken: 'access', refreshToken: 'refresh', tokenType: 'Bearer',
+    scopes: [], expiresAt: '2099-01-01T00:00:00.000Z', updatedAt: new Date().toISOString(),
+  });
+  let calls = 0;
+  const client = new TidalClient(database, {
+    requestIntervalMs: 0,
+    fetchImpl: async () => {
+      calls += 1;
+      return Response.json({ errors: [{ detail: 'Slow down.' }] }, { status: 429 });
+    },
+  });
+
+  await assert.rejects(client.addPlaylistItems('playlist', [{ trackId: 'track' }], 'key'), (error) => {
+    assert.equal(error.status, 429);
+    assert.equal(error.unsafeWrite, true);
+    return true;
+  });
+  assert.equal(calls, 1);
+  database.close();
+});

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Database } from '../src/database.js';
+import { AppError } from '../src/errors.js';
 import { SyncEngine } from '../src/sync-engine.js';
 
 const channel = { id: 'station-1', deeplink: 'test', name: 'Test Radio', number: '42' };
@@ -93,5 +94,31 @@ test('failed pagination leaves the contiguous watermark unchanged', async () => 
   assert.equal(result.status, 'partial');
   assert.equal(database.getScanState(channel.id), undefined);
   assert.equal(result.counts.synced, 1);
+  database.close();
+});
+
+test('an exhausted TIDAL rate limit stops resolution of later historical plays', async () => {
+  const database = new Database(':memory:');
+  const xm = { async page() {
+    return {
+      results: [rawPlay('newer', '2026-09-11T12:10:00.000Z'), rawPlay('older', '2026-09-11T12:00:00.000Z')],
+      next: null,
+    };
+  } };
+  const tidal = makeTidal();
+  let calls = 0;
+  tidal.validateTrack = async () => {
+    calls += 1;
+    throw new AppError('TIDAL_REQUEST_FAILED', 'TIDAL returned HTTP 429.', { status: 429, retryable: true });
+  };
+  const engine = new SyncEngine(database, xm, tidal, { clock: () => new Date('2026-09-11T13:00:00.000Z') });
+
+  const result = await engine.run('manual', channel);
+
+  assert.equal(result.status, 'failed');
+  assert.equal(result.error.status, 429);
+  assert.equal(calls, 1);
+  assert.equal(tidal.creates, 0);
+  assert.deepEqual(database.db.prepare('SELECT status FROM plays ORDER BY airplay_at').all().map((row) => row.status), ['failed', 'pending']);
   database.close();
 });

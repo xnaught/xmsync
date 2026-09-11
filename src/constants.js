@@ -10,4 +10,6 @@ export const XMPLAYLIST_URL = 'https://xmplaylist.com/api';
 export const USER_AGENT = 'xmsync/1.0 (+local personal playlist sync)';
 export const JSON_API = 'application/vnd.api+json';
 export const COUNTRY_CODE = 'US';
+export const TIDAL_REQUEST_INTERVAL_MS = 500;
+export const TIDAL_RATE_LIMIT_FALLBACK_MS = 30_000;
 export const IDEMPOTENCY_WINDOW_MS = 60 * 60 * 1000;
