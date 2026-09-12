@@ -1,5 +1,5 @@
 import { CALLBACK_URL, COUNTRY_CODE, JSON_API, TIDAL_API_URL, TIDAL_AUTH_URL, TIDAL_RATE_LIMIT_FALLBACK_MS, TIDAL_REQUEST_INTERVAL_MS, TIDAL_SCOPES, TIDAL_TOKEN_URL, USER_AGENT } from './constants.js';
-import { AppError } from './errors.js';
+import { AppError, attributeService } from './errors.js';
 import { rankCandidates } from './matching.js';
 import { fetchWithRetry, responseJson } from './request.js';
 import { nowIso, parseRetryAfter, pkceChallenge, randomUrlToken, sleep } from './util.js';
@@ -14,7 +14,9 @@ function parseScopes(value) {
 }
 
 function includedMap(body) {
-  return new Map((body?.included ?? []).map((item) => [`${item.type}:${item.id}`, item]));
+  const resources = body?.included ?? [];
+  if (!Array.isArray(resources)) throw new AppError('TIDAL_INVALID_RESPONSE', 'TIDAL returned invalid included resources.', { service: 'tidal' });
+  return new Map(resources.map((item) => [`${item.type}:${item.id}`, item]));
 }
 
 function relationshipResources(resource, name, included) {
@@ -37,7 +39,9 @@ function candidateFromResource(resource, included) {
 }
 
 export function permitsStreaming(body) {
-  const rules = (body?.included ?? []).filter((item) => item.type === 'usageRules');
+  const included = body?.included ?? [];
+  if (!Array.isArray(included)) throw new AppError('TIDAL_INVALID_RESPONSE', 'TIDAL returned invalid usage rules.', { service: 'tidal' });
+  const rules = included.filter((item) => item.type === 'usageRules');
   return rules.some((rule) => ['free', 'paid', 'subscription'].some((key) =>
     Array.isArray(rule.attributes?.[key]) && rule.attributes[key].includes('STREAM')));
 }
@@ -50,30 +54,51 @@ export class TidalClient {
     this.authUrl = options.authUrl ?? TIDAL_AUTH_URL;
     this.tokenUrl = options.tokenUrl ?? TIDAL_TOKEN_URL;
     this.requestIntervalMs = options.requestIntervalMs ?? TIDAL_REQUEST_INTERVAL_MS;
+    this.requestTimeoutMs = options.requestTimeoutMs;
     this.sleepImpl = options.sleepImpl ?? sleep;
     this.now = options.now ?? Date.now;
-    this.nextRequestAt = 0;
+    this.lastRequestAt = null;
     this.blockedUntil = 0;
     this.refreshPromise = null;
+    this.requestGate = Promise.resolve();
   }
 
-  async paceRequest() {
-    const now = this.now();
-    if (now < this.blockedUntil) {
-      throw new AppError('TIDAL_RATE_LIMITED', 'TIDAL asked the app to wait before sending more requests. Retry later.', {
-        status: 429,
-        retryable: true,
-      });
+  rateLimitError() {
+    return new AppError('TIDAL_RATE_LIMITED', 'TIDAL asked the app to wait before sending more requests. Retry later.', {
+      status: 429,
+      retryable: true,
+      service: 'tidal',
+    });
+  }
+
+  async gatedAttempt(operation) {
+    let release;
+    const previous = this.requestGate;
+    this.requestGate = new Promise((resolve) => { release = resolve; });
+    await previous;
+    try {
+      let now = this.now();
+      if (now < this.blockedUntil) throw this.rateLimitError();
+      if (this.lastRequestAt !== null) {
+        const requestAt = this.lastRequestAt + this.requestIntervalMs;
+        while (now < requestAt) {
+          await this.sleepImpl(requestAt - now);
+          now = this.now();
+          if (now < this.blockedUntil) throw this.rateLimitError();
+        }
+      }
+      if (now < this.blockedUntil) throw this.rateLimitError();
+      this.lastRequestAt = now;
+      return await operation();
+    } finally {
+      release();
     }
-    const requestAt = Math.max(now, this.nextRequestAt);
-    this.nextRequestAt = requestAt + this.requestIntervalMs;
-    if (requestAt > now) await this.sleepImpl(requestAt - now);
   }
 
   authorizationUrl() {
     const settings = this.database.settings();
     if (!settings.tidal_client_id || !settings.tidal_client_secret) {
-      throw new AppError('TIDAL_NOT_CONFIGURED', 'Save TIDAL developer credentials first.', { status: 400 });
+      throw new AppError('TIDAL_NOT_CONFIGURED', 'Save TIDAL developer credentials first.', { status: 400, service: 'tidal' });
     }
     const state = randomUrlToken();
     const verifier = randomUrlToken(64);
@@ -102,22 +127,23 @@ export class TidalClient {
         'User-Agent': USER_AGENT,
       },
       body,
-    }, { fetchImpl: this.fetchImpl, attempts: 2 });
+    }, { fetchImpl: this.fetchImpl, attempts: 2, service: 'tidal' });
     const payload = await responseJson(response, 'TIDAL');
     if (!response.ok) throw new AppError('TIDAL_TOKEN_FAILED', errorMessage(payload, 'TIDAL rejected the token request.'), {
       status: response.status,
       authRequired: ![429, 500, 502, 503, 504].includes(response.status),
       retryable: response.status === 429 || response.status >= 500,
+      service: 'tidal',
     });
     return payload;
   }
 
   async completeAuthorization(query) {
-    if (query.error) throw new AppError('TIDAL_AUTH_DENIED', query.error_description ?? 'TIDAL authorization was denied.', { status: 400 });
-    if (!query.state || !query.code) throw new AppError('TIDAL_AUTH_INVALID', 'The TIDAL callback is missing state or code.', { status: 400 });
+    if (query.error) throw new AppError('TIDAL_AUTH_DENIED', query.error_description ?? 'TIDAL authorization was denied.', { status: 400, service: 'tidal' });
+    if (!query.state || !query.code) throw new AppError('TIDAL_AUTH_INVALID', 'The TIDAL callback is missing state or code.', { status: 400, service: 'tidal' });
     const pending = this.database.consumePendingOAuth(query.state);
     if (!pending || Date.now() - Date.parse(pending.created_at) > 10 * 60_000) {
-      throw new AppError('TIDAL_AUTH_STATE', 'The TIDAL authorization attempt is invalid or expired.', { status: 400 });
+      throw new AppError('TIDAL_AUTH_STATE', 'The TIDAL authorization attempt is invalid or expired.', { status: 400, service: 'tidal' });
     }
     const payload = await this.tokenRequest({
       grant_type: 'authorization_code',
@@ -127,13 +153,13 @@ export class TidalClient {
     });
     const scopes = parseScopes(payload.scope);
     const missing = TIDAL_SCOPES.filter((scope) => !scopes.includes(scope));
-    if (missing.length) throw new AppError('TIDAL_MISSING_SCOPES', `TIDAL did not grant required scopes: ${missing.join(', ')}.`, { status: 403 });
+    if (missing.length) throw new AppError('TIDAL_MISSING_SCOPES', `TIDAL did not grant required scopes: ${missing.join(', ')}.`, { status: 403, service: 'tidal' });
     const user = await this.request('/users/me', { accessToken: payload.access_token, retryAuth: false });
     const userId = user?.data?.id;
-    if (!userId) throw new AppError('TIDAL_USER_MISSING', 'TIDAL did not return the authenticated user identity.');
+    if (!userId) throw new AppError('TIDAL_USER_MISSING', 'TIDAL did not return the authenticated user identity.', { service: 'tidal' });
     const expectedUser = this.database.settings().account_user_id;
     if (expectedUser && expectedUser !== userId) {
-      throw new AppError('TIDAL_ACCOUNT_MISMATCH', 'This database belongs to a different TIDAL account. Reconnect the original account or delete the local data directory.', { status: 409 });
+      throw new AppError('TIDAL_ACCOUNT_MISMATCH', 'This database belongs to a different TIDAL account. Reconnect the original account or delete the local data directory.', { status: 409, service: 'tidal' });
     }
     this.database.saveTokens({
       userId,
@@ -153,13 +179,13 @@ export class TidalClient {
       const old = this.database.tokens();
       if (!old?.refresh_token) {
         this.database.clearTokens();
-        throw new AppError('TIDAL_REAUTH_REQUIRED', 'TIDAL reauthorization required.', { authRequired: true });
+        throw new AppError('TIDAL_REAUTH_REQUIRED', 'TIDAL reauthorization required.', { authRequired: true, service: 'tidal' });
       }
       try {
         const payload = await this.tokenRequest({ grant_type: 'refresh_token', refresh_token: old.refresh_token });
         const scopes = parseScopes(payload.scope || old.scopes);
         const missing = TIDAL_SCOPES.filter((scope) => !scopes.includes(scope));
-        if (missing.length) throw new AppError('TIDAL_MISSING_SCOPES', `TIDAL refresh lost required scopes: ${missing.join(', ')}.`, { status: 403, authRequired: true });
+        if (missing.length) throw new AppError('TIDAL_MISSING_SCOPES', `TIDAL refresh lost required scopes: ${missing.join(', ')}.`, { status: 403, authRequired: true, service: 'tidal' });
         this.database.saveTokens({
           userId: old.user_id,
           accessToken: payload.access_token,
@@ -173,7 +199,7 @@ export class TidalClient {
       } catch (error) {
         if (error.authRequired && !error.retryable) this.database.clearTokens();
         if (error.retryable) throw error;
-        throw new AppError('TIDAL_REAUTH_REQUIRED', 'TIDAL reauthorization required.', { cause: error, authRequired: true });
+        throw new AppError('TIDAL_REAUTH_REQUIRED', 'TIDAL reauthorization required.', { cause: attributeService(error, 'tidal'), authRequired: true, service: 'tidal' });
       }
     })().finally(() => { this.refreshPromise = null; });
     return this.refreshPromise;
@@ -181,14 +207,20 @@ export class TidalClient {
 
   async accessToken() {
     const tokens = this.database.tokens();
-    if (!tokens) throw new AppError('TIDAL_REAUTH_REQUIRED', 'Connect TIDAL before syncing.', { authRequired: true });
+    if (!tokens) throw new AppError('TIDAL_REAUTH_REQUIRED', 'Connect TIDAL before syncing.', { authRequired: true, service: 'tidal' });
     if (Date.parse(tokens.expires_at) <= Date.now() + 60_000) return this.refresh();
     return tokens.access_token;
   }
 
   async request(pathOrUrl, options = {}) {
-    const url = pathOrUrl.startsWith('http') ? new URL(pathOrUrl) : new URL(`${this.apiUrl}${pathOrUrl}`);
-    if (url.origin !== new URL(this.apiUrl).origin) throw new AppError('TIDAL_INVALID_LINK', 'TIDAL returned an off-host pagination URL.');
+    if (typeof pathOrUrl !== 'string') throw new AppError('TIDAL_INVALID_LINK', 'TIDAL returned an invalid pagination URL.', { service: 'tidal' });
+    let url;
+    try {
+      url = pathOrUrl.startsWith('http') ? new URL(pathOrUrl) : new URL(`${this.apiUrl}${pathOrUrl}`);
+    } catch (error) {
+      throw new AppError('TIDAL_INVALID_LINK', 'TIDAL returned an invalid pagination URL.', { cause: error, service: 'tidal' });
+    }
+    if (url.origin !== new URL(this.apiUrl).origin) throw new AppError('TIDAL_INVALID_LINK', 'TIDAL returned an off-host pagination URL.', { service: 'tidal' });
     const token = options.accessToken ?? await this.accessToken();
     const headers = {
       Authorization: `Bearer ${token}`,
@@ -202,17 +234,21 @@ export class TidalClient {
       response = await fetchWithRetry(url, { method: options.method ?? 'GET', headers, body: options.body }, {
         fetchImpl: this.fetchImpl,
         sleepImpl: this.sleepImpl,
-        beforeAttempt: () => this.paceRequest(),
+        service: 'tidal',
+        timeoutMs: this.requestTimeoutMs,
+        attempt: (operation) => this.gatedAttempt(operation),
+        afterAttempt: (attemptResponse, context) => {
+          if (context.final && attemptResponse.status === 429) {
+            const now = this.now();
+            const retryAfter = parseRetryAfter(attemptResponse.headers.get('retry-after'), now) ?? TIDAL_RATE_LIMIT_FALLBACK_MS;
+            this.blockedUntil = Math.max(this.blockedUntil, now + retryAfter);
+          }
+        },
         attempts: options.mutation ? 1 : 3,
       });
     } catch (error) {
       if (options.mutation && error instanceof AppError) error.unsafeWrite = true;
       throw error;
-    }
-    if (response.status === 429) {
-      const now = this.now();
-      const retryAfter = parseRetryAfter(response.headers.get('retry-after'), now) ?? TIDAL_RATE_LIMIT_FALLBACK_MS;
-      this.blockedUntil = Math.max(this.blockedUntil, now + retryAfter);
     }
     let body;
     try {
@@ -237,10 +273,11 @@ export class TidalClient {
           retryable: response.status === 429 || response.status >= 500,
           authRequired,
           unsafeWrite: options.mutation,
+          service: 'tidal',
         });
     }
     if (options.mutation && (!body || typeof body !== 'object')) {
-      throw new AppError('TIDAL_INVALID_RESPONSE', 'TIDAL returned an empty mutation response.', { unsafeWrite: true });
+      throw new AppError('TIDAL_INVALID_RESPONSE', 'TIDAL returned an empty mutation response.', { unsafeWrite: true, service: 'tidal' });
     }
     return body;
   }
@@ -278,12 +315,15 @@ export class TidalClient {
     const included = includedMap(body);
     const resultResource = body?.data?.[0];
     const initialOrder = resultResource?.relationships?.tracks?.data ?? [];
+    if (!Array.isArray(initialOrder)) throw new AppError('TIDAL_INVALID_RESPONSE', 'TIDAL returned invalid search results.', { service: 'tidal' });
     let resources = initialOrder.map((item) => included.get(`${item.type}:${item.id}`)).filter(Boolean);
     if (!resources.length) resources = [...included.values()].filter((item) => item.type === 'tracks');
     if (!resources.length && resultResource?.id) {
       const relation = await this.request(`/searchResults/${encodeURIComponent(resultResource.id)}/relationships/tracks?countryCode=${COUNTRY_CODE}&include=tracks`);
       const relationIncluded = includedMap(relation);
-      resources = (relation.data ?? []).map((item) => relationIncluded.get(`${item.type}:${item.id}`)).filter(Boolean);
+      const relationData = relation.data ?? [];
+      if (!Array.isArray(relationData)) throw new AppError('TIDAL_INVALID_RESPONSE', 'TIDAL returned invalid related tracks.', { service: 'tidal' });
+      resources = relationData.map((item) => relationIncluded.get(`${item.type}:${item.id}`)).filter(Boolean);
       if (!resources.length) resources = [...relationIncluded.values()].filter((item) => item.type === 'tracks');
       for (const [key, value] of relationIncluded) included.set(key, value);
     }
@@ -309,7 +349,9 @@ export class TidalClient {
     let next = `/playlists?filter[owners.id]=me&include=owners`;
     while (next) {
       const body = await this.request(next);
-      playlists.push(...(body.data ?? []));
+      const page = body?.data ?? [];
+      if (!Array.isArray(page)) throw new AppError('TIDAL_INVALID_RESPONSE', 'TIDAL returned an invalid playlist page.', { service: 'tidal' });
+      playlists.push(...page);
       next = body.links?.next ?? null;
     }
     return playlists;
@@ -336,7 +378,9 @@ export class TidalClient {
     let next = `/playlists/${encodeURIComponent(id)}/relationships/items?countryCode=${COUNTRY_CODE}`;
     while (next) {
       const body = await this.request(next);
-      items.push(...(body.data ?? []));
+      const page = body?.data ?? [];
+      if (!Array.isArray(page)) throw new AppError('TIDAL_INVALID_RESPONSE', 'TIDAL returned an invalid playlist-item page.', { service: 'tidal' });
+      items.push(...page);
       next = body.links?.next ?? null;
     }
     return items;

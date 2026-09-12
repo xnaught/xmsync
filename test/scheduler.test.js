@@ -30,7 +30,7 @@ test('channel-local errors continue while authorization loss drops later jobs', 
   const engine = { async run(trigger, channel) {
     calls.push(channel.id);
     if (channel.id === 'a') return { error: new AppError('LOCAL', 'local failure') };
-    if (channel.id === 'b') return { error: new AppError('AUTH', 'reconnect', { authRequired: true }) };
+    if (channel.id === 'b') return { error: new AppError('AUTH', 'reconnect', { authRequired: true, service: 'tidal' }) };
     return { error: null };
   } };
   const coordinator = new RunCoordinator(engine);
@@ -39,6 +39,37 @@ test('channel-local errors continue while authorization loss drops later jobs', 
   assert.deepEqual(calls, ['a', 'b']);
   assert.equal(coordinator.errors.has('a'), true);
   assert.equal(coordinator.accountError.code, 'AUTH');
+});
+
+test('identical rate limits are channel-local for xmplaylist and account-wide for TIDAL', async () => {
+  const calls = [];
+  const errors = [
+    new AppError('XM_REQUEST_FAILED', 'limited', { status: 429, service: 'xmplaylist' }),
+    new AppError('TIDAL_REQUEST_FAILED', 'limited', { status: 429, service: 'tidal' }),
+  ];
+  const engine = { async run(trigger, channel) {
+    calls.push(channel.id);
+    return { error: errors.shift() ?? null };
+  } };
+  const coordinator = new RunCoordinator(engine);
+  coordinator.requestSweep('manual', [{ id: 'a' }, { id: 'b' }, { id: 'c' }]);
+  await tick(); await tick();
+  assert.deepEqual(calls, ['a', 'b']);
+  assert.equal(coordinator.errors.get('a').code, 'XM_REQUEST_FAILED');
+  assert.equal(coordinator.accountError.code, 'TIDAL_REQUEST_FAILED');
+});
+
+test('unexpected returned errors stop the pump and clear queued jobs', async () => {
+  const calls = [];
+  const engine = { async run(trigger, channel) {
+    calls.push(channel.id);
+    return { error: new Error('database failed') };
+  } };
+  const coordinator = new RunCoordinator(engine);
+  coordinator.requestSweep('manual', [{ id: 'a' }, { id: 'b' }]);
+  await tick(); await tick();
+  assert.deepEqual(calls, ['a']);
+  assert.equal(coordinator.queued.length, 0);
 });
 
 test('scheduler stays armed during work and rechecks a backward clock change', () => {
