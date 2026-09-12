@@ -2,7 +2,7 @@
 
 ## Pending
 
-No pending features.
+- [ ] [Safe TIDAL Playlist Bootstrap](features/safe-tidal-playlist-bootstrap.md)
 
 ## Completed
 
