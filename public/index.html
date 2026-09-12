@@ -48,16 +48,21 @@
       <div class="section-heading">
         <div>
           <p class="step">02 / FREQUENCY</p>
-          <h2 id="channel-title">SiriusXM channel</h2>
+          <h2 id="channel-title">SiriusXM channels</h2>
         </div>
-        <div class="channel-number" id="channel-number">CH --</div>
+        <div class="channel-count" id="channel-count" aria-live="polite">0 / 10 selected</div>
       </div>
-      <div class="channel-picker">
-        <label for="channel-select">Visible channels</label>
-        <select id="channel-select" disabled><option value="">Loading channels...</option></select>
-        <button class="button secondary" id="select-channel" type="button" disabled>Select channel</button>
+      <label for="channel-filter">Filter visible channels</label>
+      <input id="channel-filter" type="search" placeholder="Name or channel number" disabled>
+      <fieldset class="channel-picker" id="channel-picker" disabled>
+        <legend>Select up to ten channels</legend>
+        <div class="channel-list" id="channel-list"><p class="muted">Loading channels...</p></div>
+      </fieldset>
+      <div class="selection-actions">
+        <span id="selection-state" role="status">Saved selection</span>
+        <button class="button secondary" id="save-channels" type="button" disabled>Save channels</button>
       </div>
-      <p class="selected-channel" id="selected-channel">No channel selected</p>
+      <div class="saved-channels" id="saved-channels"><p class="muted">No channels selected.</p></div>
     </section>
 
     <section class="control-deck panel" aria-labelledby="sync-title">
@@ -69,10 +74,13 @@
         <div class="next-run"><span>NEXT RUN</span><strong id="next-run">--</strong></div>
       </div>
       <div class="transport">
-        <button class="transport-button start" id="start-button" type="button"><i></i><span>Start</span></button>
-        <button class="transport-button stop" id="stop-button" type="button"><i></i><span>Stop</span></button>
-        <button class="transport-button sync" id="sync-button" type="button"><i></i><span>Sync now</span></button>
+        <button class="transport-button start" id="start-button" type="button"><i></i><span>Start all</span></button>
+        <button class="transport-button stop" id="stop-button" type="button"><i></i><span>Stop schedule</span></button>
+        <button class="transport-button sync" id="sync-button" type="button"><i></i><span>Sync all now</span></button>
       </div>
+      <p class="muted stop-note">Stop prevents future scheduled work; it does not abort an active sync.</p>
+      <div class="queue-status" id="queue-status" aria-live="polite"></div>
+      <div class="scheduler-errors" id="scheduler-errors"></div>
       <p class="last-run" id="last-run">No completed sync yet.</p>
       <div class="meters" id="meters">
         <div><strong data-count="fetched">0</strong><span>Fetched</span></div>
@@ -91,12 +99,12 @@
           <p class="step">04 / LOGBOOK</p>
           <h2 id="runs-title">Recent runs</h2>
         </div>
-        <button class="button text" id="refresh-button" type="button">Refresh</button>
+        <div class="run-actions"><label for="run-filter">Channel</label><select id="run-filter"><option value="">All channels</option></select><button class="button text" id="refresh-button" type="button">Refresh</button></div>
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Time</th><th>Trigger</th><th>Status</th><th>Fetched</th><th>Synced</th><th>Skipped</th><th>Failed</th><th>Details</th></tr></thead>
-          <tbody id="runs-body"><tr><td colspan="8" class="empty">No runs recorded.</td></tr></tbody>
+          <thead><tr><th>Channel</th><th>Time</th><th>Trigger</th><th>Status</th><th>Fetched</th><th>Synced</th><th>Skipped</th><th>Failed</th><th>Details</th></tr></thead>
+          <tbody id="runs-body"><tr><td colspan="9" class="empty">No runs recorded.</td></tr></tbody>
         </table>
       </div>
     </section>

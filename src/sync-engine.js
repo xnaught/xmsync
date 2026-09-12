@@ -89,7 +89,7 @@ export class SyncEngine {
       if (!trackId) {
         counts.skipped += 1;
         const message = 'No TIDAL track was found.';
-        this.database.setPlayOutcome(play.play_id, 'skipped', { errorCode: 'NO_TIDAL_MATCH', errorMessage: message }, nowIso());
+        this.database.setPlayOutcome(play.channel_id, play.play_id, 'skipped', { errorCode: 'NO_TIDAL_MATCH', errorMessage: message }, nowIso());
         this.database.addRunItem(runId, runItemFromPlay(play, 'skipped', { errorCode: 'NO_TIDAL_MATCH', errorMessage: message }));
         return null;
       }
@@ -102,13 +102,13 @@ export class SyncEngine {
         resolvedAt: nowIso(),
         validationState: 'available_us',
       });
-      this.database.setPlayResolved(play.play_id, trackId, method, nowIso());
+      this.database.setPlayResolved(play.channel_id, play.play_id, trackId, method, nowIso());
       if (method === 'direct_link') counts.directMatched += 1;
       else counts.searchMatched += 1;
       return { ...play, tidal_track_id: trackId, match_method: method };
     } catch (error) {
       counts.failed += 1;
-      this.database.setPlayOutcome(play.play_id, 'failed', { errorCode: error.code ?? 'RESOLUTION_FAILED', errorMessage: error.message }, nowIso());
+      this.database.setPlayOutcome(play.channel_id, play.play_id, 'failed', { errorCode: error.code ?? 'RESOLUTION_FAILED', errorMessage: error.message }, nowIso());
       this.database.addRunItem(runId, runItemFromPlay(play, 'failed', {
         errorCode: error.code ?? 'RESOLUTION_FAILED', errorMessage: error.message,
       }));
@@ -124,12 +124,13 @@ export class SyncEngine {
   }
 
   async ensurePlaylist(channel, date, runId) {
-    const expectedName = playlistName(channel.name, date);
+    const label = channel.playlistLabel ?? channel.name;
+    const expectedName = playlistName(label, date);
     const payload = JSON.stringify({ data: { type: 'playlists', attributes: {
-      name: expectedName, description: playlistDescription(channel.name, date), accessType: 'UNLISTED',
+      name: expectedName, description: playlistDescription(label, date), accessType: 'UNLISTED',
     } } });
     const payloadHash = stableHash(payload);
-    let batch = this.database.findPendingBatch('create_playlist', expectedName, payloadHash);
+    let batch = this.database.findPendingBatch(channel.id, date, 'create_playlist', expectedName, payloadHash);
     const saved = this.database.playlist(channel.id, date);
     if (saved) {
       try {
@@ -153,6 +154,10 @@ export class SyncEngine {
     }
     if (matches.length === 1) {
       const playlist = matches[0];
+      const owner = this.database.playlistOwner(playlist.id);
+      if (owner && (owner.channel_id !== channel.id || owner.local_date !== date)) {
+        throw new AppError('PLAYLIST_ALREADY_MAPPED', `The playlist "${expectedName}" is already managed for another channel or date.`, { unsafeWrite: true });
+      }
       this.database.transaction(() => {
         this.database.savePlaylist({
           channelId: channel.id, localDate: date, expectedName, playlistId: playlist.id,
@@ -175,13 +180,13 @@ export class SyncEngine {
     }
     if (!batch) {
       const id = this.database.createBatch({
-        operation: 'create_playlist', targetId: expectedName, idempotencyKey: randomUUID(), payload,
+        channelId: channel.id, localDate: date, operation: 'create_playlist', targetId: expectedName, idempotencyKey: randomUUID(), payload,
         payloadHash, playIds: [], createdAt: nowIso(),
       });
       batch = { id, idempotency_key: this.database.db.prepare('SELECT idempotency_key FROM write_batches WHERE id=?').get(id).idempotency_key };
     }
     this.database.attemptedBatch(batch.id, nowIso());
-    const response = await this.tidal.createPlaylist(expectedName, playlistDescription(channel.name, date), batch.idempotency_key);
+    const response = await this.tidal.createPlaylist(expectedName, playlistDescription(label, date), batch.idempotency_key);
     const playlistId = response?.data?.id;
     if (!playlistId) throw new AppError('TIDAL_INVALID_RESPONSE', 'TIDAL did not return the created playlist ID.', { unsafeWrite: true });
     this.database.transaction(() => {
@@ -208,7 +213,7 @@ export class SyncEngine {
       }
       this.database.transaction(() => {
         plays.forEach((play, index) => {
-          this.database.setPlayOutcome(play.play_id, 'synced', { playlistId, occurrenceId: segment[index].meta?.itemId }, nowIso());
+          this.database.setPlayOutcome(play.channel_id, play.play_id, 'synced', { playlistId, occurrenceId: segment[index].meta?.itemId }, nowIso());
           this.database.addRunItem(runId, runItemFromPlay(play, 'synced'));
         });
         this.database.completeBatch(batch.id, { recoveredFromPlaylistSuffix: true }, nowIso());
@@ -222,7 +227,9 @@ export class SyncEngine {
     const payload = JSON.stringify({ data: plays.map((play) => ({ type: 'tracks', id: play.tidal_track_id })) });
     const payloadHash = stableHash(payload);
     const playIds = plays.map((play) => play.play_id);
-    let batch = existingBatch ?? this.database.findPendingBatch('add_items', playlistId, payloadHash, playIds);
+    const channelId = plays[0].channel_id;
+    const localDate = plays[0].local_date;
+    let batch = existingBatch ?? this.database.findPendingBatch(channelId, localDate, 'add_items', playlistId, payloadHash, playIds);
     if (batch?.attempted_at && Date.now() - Date.parse(batch.attempted_at) >= IDEMPOTENCY_WINDOW_MS) {
       await this.recoverOldAddBatch(batch, playlistId, plays, runId, counts);
       return;
@@ -232,7 +239,7 @@ export class SyncEngine {
       const tail = existingItems.at(-1);
       const idempotencyKey = randomUUID();
       const id = this.database.createBatch({
-        operation: 'add_items', targetId: playlistId, idempotencyKey, payload, payloadHash,
+        channelId, localDate, operation: 'add_items', targetId: playlistId, idempotencyKey, payload, payloadHash,
         playIds, precondition: { count: existingItems.length, tailItemId: tail?.meta?.itemId ?? null }, createdAt: nowIso(),
       });
       batch = { id, idempotency_key: idempotencyKey };
@@ -245,7 +252,7 @@ export class SyncEngine {
     } catch (error) {
       for (const play of plays) {
         counts.failed += 1;
-        this.database.setPlayOutcome(play.play_id, 'failed', { errorCode: error.code ?? 'PLAYLIST_WRITE_FAILED', errorMessage: error.message }, nowIso());
+        this.database.setPlayOutcome(play.channel_id, play.play_id, 'failed', { errorCode: error.code ?? 'PLAYLIST_WRITE_FAILED', errorMessage: error.message }, nowIso());
         this.database.addRunItem(runId, runItemFromPlay(play, 'failed', { errorCode: error.code ?? 'PLAYLIST_WRITE_FAILED', errorMessage: error.message }));
       }
       throw error;
@@ -283,17 +290,17 @@ export class SyncEngine {
         const outcome = outcomes[index];
         if (outcome.type === 'synced') {
           counts.synced += 1;
-          this.database.setPlayOutcome(play.play_id, 'synced', { playlistId, occurrenceId: outcome.item.meta?.itemId }, nowIso());
+          this.database.setPlayOutcome(play.channel_id, play.play_id, 'synced', { playlistId, occurrenceId: outcome.item.meta?.itemId }, nowIso());
           this.database.addRunItem(runId, runItemFromPlay(play, 'synced'));
         } else if (outcome.type === 'skipped') {
           counts.skipped += 1;
           const reason = `TIDAL skipped this playlist item: ${outcome.reason}.`;
-          this.database.setPlayOutcome(play.play_id, 'skipped', { playlistId, errorCode: 'TIDAL_ITEM_SKIPPED', errorMessage: reason }, nowIso());
+          this.database.setPlayOutcome(play.channel_id, play.play_id, 'skipped', { playlistId, errorCode: 'TIDAL_ITEM_SKIPPED', errorMessage: reason }, nowIso());
           this.database.addRunItem(runId, runItemFromPlay(play, 'skipped', { errorCode: 'TIDAL_ITEM_SKIPPED', errorMessage: reason }));
         } else {
           counts.failed += 1;
           const reason = 'TIDAL did not report an outcome for this playlist item.';
-          this.database.setPlayOutcome(play.play_id, 'failed', { errorCode: 'TIDAL_ITEM_UNKNOWN', errorMessage: reason }, nowIso());
+          this.database.setPlayOutcome(play.channel_id, play.play_id, 'failed', { errorCode: 'TIDAL_ITEM_UNKNOWN', errorMessage: reason }, nowIso());
           this.database.addRunItem(runId, runItemFromPlay(play, 'failed', { errorCode: 'TIDAL_ITEM_UNKNOWN', errorMessage: reason }));
         }
       }
@@ -328,7 +335,7 @@ export class SyncEngine {
 
       const remaining = new Map(resolved.map((play) => [play.play_id, play]));
       let blockWrites = false;
-      for (const batch of this.database.pendingAddBatches()) {
+      for (const batch of this.database.pendingAddBatches(channel.id)) {
         const playIds = JSON.parse(batch.play_ids_json);
         const batchPlays = playIds.map((id) => remaining.get(id));
         if (batchPlays.some((play) => !play)) continue;
@@ -353,10 +360,10 @@ export class SyncEngine {
         } catch (error) {
           topError ??= error;
           for (const play of plays.filter((item) => item.status !== 'synced')) {
-            const latest = this.database.db.prepare('SELECT status FROM plays WHERE play_id=?').get(play.play_id);
+            const latest = this.database.play(channel.id, play.play_id);
             if (latest?.status !== 'pending') continue;
             counts.failed += 1;
-            this.database.setPlayOutcome(play.play_id, 'failed', { errorCode: error.code ?? 'PLAYLIST_FAILED', errorMessage: error.message }, nowIso());
+            this.database.setPlayOutcome(play.channel_id, play.play_id, 'failed', { errorCode: error.code ?? 'PLAYLIST_FAILED', errorMessage: error.message }, nowIso());
             this.database.addRunItem(runId, runItemFromPlay(play, 'failed', { errorCode: error.code ?? 'PLAYLIST_FAILED', errorMessage: error.message }));
           }
           if (error.authRequired || error.unsafeWrite || error.status === 429) break;
