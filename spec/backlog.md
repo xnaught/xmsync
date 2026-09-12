@@ -2,6 +2,7 @@
 
 ## Pending
 
+- [ ] [Multi-Channel Sync](features/multi-channel-sync.md)
 - [ ] [Safe TIDAL Playlist Bootstrap](features/safe-tidal-playlist-bootstrap.md)
 
 ## Completed
