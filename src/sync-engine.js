@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { IDEMPOTENCY_WINDOW_MS } from './constants.js';
-import { AppError } from './errors.js';
+import { AppError, failureScope, preferRunError } from './errors.js';
 import { parseXmCursor, normalizePlay } from './xmplaylist.js';
 import { chunk, nowIso, playlistDescription, playlistName, stableHash, yesterdayMidnight } from './util.js';
 
@@ -107,12 +107,13 @@ export class SyncEngine {
       else counts.searchMatched += 1;
       return { ...play, tidal_track_id: trackId, match_method: method };
     } catch (error) {
+      if (failureScope(error) === 'process') throw error;
       counts.failed += 1;
       this.database.setPlayOutcome(play.channel_id, play.play_id, 'failed', { errorCode: error.code ?? 'RESOLUTION_FAILED', errorMessage: error.message }, nowIso());
       this.database.addRunItem(runId, runItemFromPlay(play, 'failed', {
         errorCode: error.code ?? 'RESOLUTION_FAILED', errorMessage: error.message,
       }));
-      if (error.authRequired || error.status === 429) throw error;
+      if (failureScope(error) === 'account') throw error;
       return null;
     }
   }
@@ -188,7 +189,7 @@ export class SyncEngine {
     this.database.attemptedBatch(batch.id, nowIso());
     const response = await this.tidal.createPlaylist(expectedName, playlistDescription(label, date), batch.idempotency_key);
     const playlistId = response?.data?.id;
-    if (!playlistId) throw new AppError('TIDAL_INVALID_RESPONSE', 'TIDAL did not return the created playlist ID.', { unsafeWrite: true });
+    if (!playlistId) throw new AppError('TIDAL_INVALID_RESPONSE', 'TIDAL did not return the created playlist ID.', { unsafeWrite: true, service: 'tidal' });
     this.database.transaction(() => {
       this.database.savePlaylist({
         channelId: channel.id, localDate: date, expectedName, playlistId,
@@ -321,7 +322,8 @@ export class SyncEngine {
       try {
         await this.scan(channel, cutoff, runStart, runId, counts);
       } catch (error) {
-        topError = error;
+        if (failureScope(error) === 'process') throw error;
+        topError = preferRunError(topError, error);
         counts.failed += 1;
         this.database.addRunItem(runId, { outcome: 'failed', errorCode: error.code ?? 'SCAN_FAILED', errorMessage: error.message });
       }
@@ -343,9 +345,11 @@ export class SyncEngine {
           await this.writeBatch(batch.target_id, batchPlays, runId, counts, batch);
           playIds.forEach((id) => remaining.delete(id));
         } catch (error) {
-          topError ??= error;
+          topError = preferRunError(topError, error);
           playIds.forEach((id) => remaining.delete(id));
-          if (error.authRequired || error.unsafeWrite || error.status === 429) {
+          const scope = failureScope(error);
+          if (scope === 'process' || scope === 'account') throw error;
+          if (error.unsafeWrite) {
             blockWrites = true;
             break;
           }
@@ -358,7 +362,9 @@ export class SyncEngine {
           const playlistId = await this.ensurePlaylist(channel, date, runId);
           for (const batch of chunk(plays, 50)) await this.writeBatch(playlistId, batch, runId, counts);
         } catch (error) {
-          topError ??= error;
+          topError = preferRunError(topError, error);
+          const scope = failureScope(error);
+          if (scope === 'process') throw error;
           for (const play of plays.filter((item) => item.status !== 'synced')) {
             const latest = this.database.play(channel.id, play.play_id);
             if (latest?.status !== 'pending') continue;
@@ -366,11 +372,12 @@ export class SyncEngine {
             this.database.setPlayOutcome(play.channel_id, play.play_id, 'failed', { errorCode: error.code ?? 'PLAYLIST_FAILED', errorMessage: error.message }, nowIso());
             this.database.addRunItem(runId, runItemFromPlay(play, 'failed', { errorCode: error.code ?? 'PLAYLIST_FAILED', errorMessage: error.message }));
           }
-          if (error.authRequired || error.unsafeWrite || error.status === 429) break;
+          if (scope === 'account') throw error;
+          if (error.unsafeWrite) break;
         }
       }
     } catch (error) {
-      topError ??= error;
+      topError = preferRunError(topError, error);
     }
 
     if (!topError && counts.failed) topError = new AppError('SYNC_ITEMS_FAILED', 'One or more airplays failed and will be retried.');

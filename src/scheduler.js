@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { publicError } from './errors.js';
+import { failureScope, publicError } from './errors.js';
 import { nextHalfHour } from './util.js';
 
 const TRIGGER_PRIORITY = new Map([
@@ -111,10 +111,11 @@ export class RunCoordinator {
         if (error) this.errors.set(job.channel.id, { channelId: job.channel.id, ...visible });
         else this.errors.delete(job.channel.id);
         this.finishSweeps(job, Boolean(error));
-        if (error?.authRequired || error?.status === 429) {
+        const scope = error ? failureScope(error) : null;
+        if (scope === 'account') {
           this.accountError = visible;
           this.cancelQueued(() => true);
-        } else if (error && !error.code) {
+        } else if (scope === 'process') {
           stopPump = true;
           this.cancelQueued(() => true);
         } else if (!error) {

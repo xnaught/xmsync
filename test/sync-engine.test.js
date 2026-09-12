@@ -2,7 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Database } from '../src/database.js';
 import { AppError } from '../src/errors.js';
+import { RunCoordinator } from '../src/scheduler.js';
 import { SyncEngine } from '../src/sync-engine.js';
+import { TidalClient } from '../src/tidal.js';
+import { XmPlaylistClient } from '../src/xmplaylist.js';
 
 const channel = { id: 'station-1', deeplink: 'test', name: 'Test Radio', number: '42' };
 
@@ -32,6 +35,10 @@ function makeTidal() {
     },
     async playlistItems() { return this.playlistContents; },
   };
+}
+
+async function waitForIdle(coordinator) {
+  while (coordinator.active) await new Promise((resolve) => setImmediate(resolve));
 }
 
 test('distinct repeated airplays append as distinct ordered playlist occurrences and do not duplicate on retry', async () => {
@@ -82,7 +89,7 @@ test('failed pagination leaves the contiguous watermark unchanged', async () => 
   let calls = 0;
   const xm = { async page() {
     calls += 1;
-    if (calls === 2) throw Object.assign(new Error('page failed'), { code: 'XM_REQUEST_FAILED' });
+    if (calls === 2) throw new AppError('XM_REQUEST_FAILED', 'page failed', { service: 'xmplaylist' });
     return {
       results: [rawPlay('play', '2026-09-11T12:00:00.000Z')],
       next: 'http://xmplaylist.com/api/station/test?last=1789128000000',
@@ -109,7 +116,7 @@ test('an exhausted TIDAL rate limit stops resolution of later historical plays',
   let calls = 0;
   tidal.validateTrack = async () => {
     calls += 1;
-    throw new AppError('TIDAL_REQUEST_FAILED', 'TIDAL returned HTTP 429.', { status: 429, retryable: true });
+    throw new AppError('TIDAL_REQUEST_FAILED', 'TIDAL returned HTTP 429.', { status: 429, retryable: true, service: 'tidal' });
   };
   const engine = new SyncEngine(database, xm, tidal, { clock: () => new Date('2026-09-11T13:00:00.000Z') });
 
@@ -141,5 +148,133 @@ test('two channels independently sync the same raw play ID using stable playlist
   assert.deepEqual(database.db.prepare('SELECT expected_name FROM playlists ORDER BY channel_id').all().map((row) => row.expected_name), [
     'Blend (Ch. 1) - 2026-09-11', 'Blend (Ch. 2) - 2026-09-11',
   ]);
+  database.close();
+});
+
+test('a scan failure is retained while a later TIDAL account failure becomes the run error', async () => {
+  const database = new Database(':memory:');
+  let pages = 0;
+  const xm = { async page() {
+    pages += 1;
+    if (pages === 2) throw new AppError('XM_REQUEST_FAILED', 'scan limited', { status: 429, service: 'xmplaylist' });
+    return {
+      results: [rawPlay('play', '2026-09-11T12:00:00.000Z')],
+      next: 'https://xmplaylist.com/api/station/test?last=1',
+    };
+  } };
+  const tidal = makeTidal();
+  tidal.validateTrack = async () => {
+    throw new AppError('TIDAL_REQUEST_FAILED', 'account limited', { status: 429, retryable: true, service: 'tidal' });
+  };
+  const engine = new SyncEngine(database, xm, tidal, { clock: () => new Date('2026-09-11T13:00:00.000Z') });
+
+  const result = await engine.run('manual', channel);
+
+  assert.equal(result.error.code, 'TIDAL_REQUEST_FAILED');
+  assert.deepEqual(database.runItems(result.id).map((item) => item.error_code), ['XM_REQUEST_FAILED', 'TIDAL_REQUEST_FAILED']);
+  database.close();
+});
+
+test('a scan failure cannot mask later TIDAL authorization loss', async () => {
+  const database = new Database(':memory:');
+  let pages = 0;
+  const xm = { async page() {
+    pages += 1;
+    if (pages === 2) throw new AppError('XM_REQUEST_FAILED', 'scan failed', { service: 'xmplaylist' });
+    return { results: [rawPlay('play', '2026-09-11T12:00:00.000Z')], next: 'https://xmplaylist.com/api/station/test?last=1' };
+  } };
+  const tidal = makeTidal();
+  tidal.validateTrack = async () => {
+    throw new AppError('TIDAL_REAUTH_REQUIRED', 'reauthorize', { authRequired: true, service: 'tidal' });
+  };
+  const engine = new SyncEngine(database, xm, tidal, { clock: () => new Date('2026-09-11T13:00:00.000Z') });
+
+  const result = await engine.run('manual', channel);
+
+  assert.equal(result.error.code, 'TIDAL_REAUTH_REQUIRED');
+  assert.equal(result.error.authRequired, true);
+  assert.equal(database.runItems(result.id)[0].error_code, 'XM_REQUEST_FAILED');
+  database.close();
+});
+
+test('an exhausted xmplaylist rate limit crosses the real engine boundary without cancelling the next channel', async () => {
+  const database = new Database(':memory:');
+  const calls = [];
+  const xm = new XmPlaylistClient({
+    sleepImpl: async () => {},
+    fetchImpl: async (url) => {
+      calls.push(String(url));
+      if (String(url).includes('/station/first')) return new Response('{}', { status: 429 });
+      return Response.json({ results: [], next: null });
+    },
+  });
+  const engine = new SyncEngine(database, xm, makeTidal(), { clock: () => new Date('2026-09-11T13:00:00.000Z') });
+  const coordinator = new RunCoordinator(engine);
+  coordinator.requestSweep('manual', [
+    { id: 'first', deeplink: 'first', name: 'First', number: '1' },
+    { id: 'second', deeplink: 'second', name: 'Second', number: '2' },
+  ]);
+  await waitForIdle(coordinator);
+
+  assert.equal(calls.filter((url) => url.includes('/station/first')).length, 3);
+  assert.equal(calls.filter((url) => url.includes('/station/second')).length, 1);
+  assert.equal(coordinator.accountError, null);
+  database.close();
+});
+
+test('a real TIDAL rate limit from the engine cancels queued channels', async () => {
+  const database = new Database(':memory:');
+  database.saveTokens({
+    userId: 'user', accessToken: 'access', refreshToken: 'refresh', tokenType: 'Bearer', scopes: [],
+    expiresAt: '2099-01-01T00:00:00.000Z', updatedAt: new Date().toISOString(),
+  });
+  const scanned = [];
+  const xm = { async page(deeplink) {
+    scanned.push(deeplink);
+    return { results: [rawPlay(`play-${deeplink}`, '2026-09-11T12:00:00.000Z')], next: null };
+  } };
+  let tidalCalls = 0;
+  const tidal = new TidalClient(database, {
+    requestIntervalMs: 0,
+    fetchImpl: async () => {
+      tidalCalls += 1;
+      return new Response('{}', { status: 429, headers: { 'Retry-After': '30' } });
+    },
+  });
+  const engine = new SyncEngine(database, xm, tidal, { clock: () => new Date('2026-09-11T13:00:00.000Z') });
+  const coordinator = new RunCoordinator(engine);
+  coordinator.requestSweep('manual', [
+    { id: 'first', deeplink: 'first', name: 'First', number: '1' },
+    { id: 'second', deeplink: 'second', name: 'Second', number: '2' },
+  ]);
+  await waitForIdle(coordinator);
+
+  assert.deepEqual(scanned, ['first']);
+  assert.equal(tidalCalls, 1);
+  assert.equal(coordinator.accountError.code, 'TIDAL_REQUEST_FAILED');
+  database.close();
+});
+
+test('an unexpected scan failure performs no TIDAL work and stops the coordinator', async () => {
+  const database = new Database(':memory:');
+  const scanned = [];
+  const xm = { async page(deeplink) {
+    scanned.push(deeplink);
+    throw new Error('database invariant failed');
+  } };
+  const tidal = makeTidal();
+  let tidalCalls = 0;
+  tidal.validateTrack = async () => { tidalCalls += 1; return null; };
+  const engine = new SyncEngine(database, xm, tidal, { clock: () => new Date('2026-09-11T13:00:00.000Z') });
+  const coordinator = new RunCoordinator(engine);
+  coordinator.requestSweep('manual', [
+    { id: 'first', deeplink: 'first', name: 'First', number: '1' },
+    { id: 'second', deeplink: 'second', name: 'Second', number: '2' },
+  ]);
+  await waitForIdle(coordinator);
+
+  assert.deepEqual(scanned, ['first']);
+  assert.equal(tidalCalls, 0);
+  assert.equal(coordinator.queued.length, 0);
   database.close();
 });

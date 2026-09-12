@@ -3,6 +3,8 @@
 ## Project specs and features
 
 - These are markdown documents in the `spec` directory.
+- Add each new feature written up in `spec/features/` to the pending section of `spec/backlog.md`.
+- When a feature is complete, mark it as completed in `spec/backlog.md`.
 - The spec we used to make the initial version of this application is in `spec/ORIGINAL-SPEC.md`. This is interesting from an historical perspective, but has likely drifted in terms of accuracy.
 
 ## Toolchain And Commands

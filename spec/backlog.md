@@ -8,3 +8,4 @@
 
 - [x] [Multi-Channel Sync](features/multi-channel-sync.md)
 - [x] [TIDAL Rate-Limit Handling](features/tidal-rate-limit-handling.md)
+- [x] [Multi-Channel Rate-Limit Hardening](features/multi-channel-rate-limit-hardening.md)
