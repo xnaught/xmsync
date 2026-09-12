@@ -83,9 +83,45 @@ async function serveStatic(pathname, response) {
 
 function requireSyncReady(database) {
   const settings = database.settings();
-  if (!settings.channel_id) throw new AppError('CHANNEL_REQUIRED', 'Select a SiriusXM channel first.', { status: 400 });
+  if (database.selectedChannels().length === 0) throw new AppError('CHANNEL_REQUIRED', 'Select at least one SiriusXM channel first.', { status: 400 });
   if (!settings.tidal_client_id || !settings.tidal_client_secret) throw new AppError('TIDAL_NOT_CONFIGURED', 'Save TIDAL developer credentials first.', { status: 400 });
   if (!database.tokens()) throw new AppError('TIDAL_REAUTH_REQUIRED', 'Connect TIDAL before syncing.', { status: 401, authRequired: true });
+}
+
+function normalizedName(name) {
+  return String(name).trim().toLocaleLowerCase('en-US');
+}
+
+function mergedChannels(database, catalog) {
+  const selected = database.selectedChannels();
+  const selectedById = new Map(selected.map((channel) => [channel.id, channel]));
+  const rows = catalog.map((channel) => {
+    const saved = selectedById.get(channel.id);
+    selectedById.delete(channel.id);
+    return {
+      id: channel.id, deeplink: channel.deeplink, name: channel.name, number: String(channel.number),
+      selected: Boolean(saved), selectedPosition: saved?.selectedPosition ?? null,
+      playlistLabel: saved?.playlistLabel ?? null, available: true,
+    };
+  });
+  for (const saved of selectedById.values()) rows.push({ ...saved, selected: true, available: false });
+  return rows;
+}
+
+function selectionSnapshots(database, catalog, ids) {
+  const live = new Map(catalog.map((channel) => [channel.id, channel]));
+  const persisted = new Map(database.persistedChannels().map((channel) => [channel.id, channel]));
+  const duplicateNames = Map.groupBy(catalog, (channel) => normalizedName(channel.name));
+  return ids.map((id) => {
+    const existing = persisted.get(id);
+    const channel = live.get(id) ?? existing;
+    if (!channel || (!live.has(id) && !database.selectedChannels().some((selected) => selected.id === id))) {
+      throw new AppError('CHANNEL_INVALID', `Channel ${id} is not available in the current xmplaylist catalog.`, { status: 400 });
+    }
+    if (existing) return { ...channel, playlistLabel: existing.playlistLabel };
+    const collides = (duplicateNames.get(normalizedName(channel.name))?.length ?? 0) > 1;
+    return { ...channel, playlistLabel: collides ? `${String(channel.name).trim()} (Ch. ${channel.number})` : String(channel.name).trim() };
+  });
 }
 
 export function createHttpServer({ database, xm, tidal, coordinator, scheduler }) {
@@ -115,6 +151,8 @@ export function createHttpServer({ database, xm, tidal, coordinator, scheduler }
       if (request.method === 'GET' && url.pathname === '/auth/tidal/callback') {
         try {
           await tidal.completeAuthorization(Object.fromEntries(url.searchParams));
+          coordinator.accountError = null;
+          coordinator.onChange?.();
           return redirect(response, '/?auth=connected');
         } catch (error) {
           const params = new URLSearchParams({ auth: 'error', code: error.code ?? 'TIDAL_AUTH_FAILED' });
@@ -133,19 +171,21 @@ export function createHttpServer({ database, xm, tidal, coordinator, scheduler }
         return sendJson(response, 200, await runTidalSmokeTest(tidal));
       }
       if (request.method === 'GET' && url.pathname === '/api/channels') {
-        return sendJson(response, 200, { channels: await xm.listChannels() });
+        const catalog = await xm.listChannels();
+        return sendJson(response, 200, { channels: mergedChannels(database, catalog), selectionLimit: 10 });
       }
-      if (request.method === 'PUT' && url.pathname === '/api/channel') {
+      if (request.method === 'PUT' && url.pathname === '/api/channels') {
         enforceSameOrigin(request);
         const body = await jsonBody(request);
-        const channels = await xm.listChannels();
-        const channel = channels.find((item) => item.id === body.id || item.deeplink === String(body.deeplink ?? '').toLowerCase());
-        if (!channel) throw new AppError('CHANNEL_INVALID', 'Select a channel from the current xmplaylist list.', { status: 400 });
-        const changed = database.settings().channel_id !== channel.id;
-        database.saveChannel(channel);
-        if (changed && database.tokens()) scheduler.channelChanged();
-        else scheduler.arm();
-        return sendJson(response, 200, { channel, syncRequested: changed && Boolean(database.tokens()) });
+        if (!body || typeof body !== 'object' || !Array.isArray(body.ids) || body.ids.some((id) => typeof id !== 'string' || !id)) {
+          throw new AppError('CHANNEL_IDS_REQUIRED', 'ids must be an array of channel ID strings.', { status: 400 });
+        }
+        if (new Set(body.ids).size !== body.ids.length) throw new AppError('CHANNEL_DUPLICATE', 'Duplicate channel IDs are not allowed.', { status: 400 });
+        if (body.ids.length > 10) throw new AppError('CHANNEL_LIMIT', 'Select no more than ten channels.', { status: 400 });
+        const catalog = await xm.listChannels();
+        const replacement = database.replaceSelectedChannels(selectionSnapshots(database, catalog, body.ids));
+        const catchUp = scheduler.selectionChanged(replacement.added, replacement.removed, Boolean(database.tokens()));
+        return sendJson(response, 200, { channels: replacement.selected, catchUpRequested: catchUp.requested });
       }
       if (request.method === 'POST' && url.pathname === '/api/sync/start') {
         enforceSameOrigin(request);
@@ -154,8 +194,7 @@ export function createHttpServer({ database, xm, tidal, coordinator, scheduler }
       }
       if (request.method === 'POST' && url.pathname === '/api/sync/stop') {
         enforceSameOrigin(request);
-        scheduler.stop();
-        return sendJson(response, 200, { stopped: true });
+        return sendJson(response, 200, scheduler.stop());
       }
       if (request.method === 'POST' && url.pathname === '/api/sync/now') {
         enforceSameOrigin(request);
@@ -163,7 +202,10 @@ export function createHttpServer({ database, xm, tidal, coordinator, scheduler }
         return sendJson(response, 202, scheduler.syncNow());
       }
       if (request.method === 'GET' && url.pathname === '/api/runs') {
-        return sendJson(response, 200, { runs: runsView(database) });
+        const rawLimit = url.searchParams.get('limit');
+        const limit = rawLimit === null ? 20 : Number(rawLimit);
+        if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new AppError('RUN_LIMIT_INVALID', 'limit must be an integer from 1 to 100.', { status: 400 });
+        return sendJson(response, 200, { runs: runsView(database, { channelId: url.searchParams.get('channelId'), limit }) });
       }
       if (request.method === 'GET' || request.method === 'HEAD') {
         if (await serveStatic(url.pathname, response)) return;

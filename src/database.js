@@ -2,7 +2,8 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-const MIGRATION = `
+const LATEST_SCHEMA_VERSION = 2;
+const SCHEMA = `
 CREATE TABLE IF NOT EXISTS settings (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   tidal_client_id TEXT,
@@ -44,6 +45,18 @@ CREATE TABLE IF NOT EXISTS playlists (
   last_seen_at TEXT NOT NULL,
   PRIMARY KEY (channel_id, local_date)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS playlists_tidal_owner_idx ON playlists(tidal_playlist_id);
+
+CREATE TABLE IF NOT EXISTS channels (
+  channel_id TEXT PRIMARY KEY,
+  deeplink TEXT NOT NULL,
+  display_name TEXT NOT NULL,
+  channel_number TEXT NOT NULL,
+  playlist_label TEXT NOT NULL,
+  selected_position INTEGER UNIQUE,
+  first_selected_at TEXT NOT NULL,
+  last_updated_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS track_mappings (
   xm_track_id TEXT NOT NULL,
@@ -56,7 +69,7 @@ CREATE TABLE IF NOT EXISTS track_mappings (
 );
 
 CREATE TABLE IF NOT EXISTS plays (
-  play_id TEXT PRIMARY KEY,
+  play_id TEXT NOT NULL,
   channel_id TEXT NOT NULL,
   airplay_at TEXT NOT NULL,
   local_date TEXT NOT NULL,
@@ -66,13 +79,14 @@ CREATE TABLE IF NOT EXISTS plays (
   tidal_link TEXT,
   tidal_track_id TEXT,
   match_method TEXT,
-  status TEXT NOT NULL CHECK (status IN ('pending', 'synced', 'skipped', 'failed')),
+  status TEXT NOT NULL CHECK (status IN ('pending', 'synced', 'skipped', 'failed', 'recovered')),
   playlist_id TEXT,
   occurrence_id TEXT,
   error_code TEXT,
   error_message TEXT,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (channel_id, play_id)
 );
 CREATE INDEX IF NOT EXISTS plays_process_idx ON plays(channel_id, status, airplay_at);
 
@@ -81,6 +95,7 @@ CREATE TABLE IF NOT EXISTS sync_runs (
   trigger TEXT NOT NULL,
   channel_id TEXT NOT NULL,
   channel_name TEXT NOT NULL,
+  channel_number TEXT,
   started_at TEXT NOT NULL,
   ended_at TEXT,
   status TEXT NOT NULL,
@@ -91,6 +106,7 @@ CREATE TABLE IF NOT EXISTS sync_runs (
   synced INTEGER NOT NULL DEFAULT 0,
   skipped INTEGER NOT NULL DEFAULT 0,
   failed INTEGER NOT NULL DEFAULT 0,
+  recovered INTEGER NOT NULL DEFAULT 0,
   error_message TEXT
 );
 
@@ -110,6 +126,8 @@ CREATE INDEX IF NOT EXISTS run_items_run_idx ON run_items(run_id);
 
 CREATE TABLE IF NOT EXISTS write_batches (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  channel_id TEXT,
+  local_date TEXT,
   operation TEXT NOT NULL,
   target_id TEXT NOT NULL,
   idempotency_key TEXT NOT NULL UNIQUE,
@@ -121,7 +139,8 @@ CREATE TABLE IF NOT EXISTS write_batches (
   created_at TEXT NOT NULL,
   attempted_at TEXT,
   completed_at TEXT,
-  response_json TEXT
+  response_json TEXT,
+  CHECK (status = 'completed' OR (channel_id IS NOT NULL AND local_date IS NOT NULL))
 );
 
 CREATE TABLE IF NOT EXISTS channel_scan_state (
@@ -129,8 +148,39 @@ CREATE TABLE IF NOT EXISTS channel_scan_state (
   watermark TEXT NOT NULL,
   last_complete_at TEXT NOT NULL
 );
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 `;
+
+function tableColumns(db, table) {
+  return new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((row) => row.name));
+}
+
+function inferLegacyBatchOwner(db, batch, legacyChannelId) {
+  const candidates = new Map();
+  const add = (channelId, localDate) => {
+    if (channelId && localDate) candidates.set(`${channelId}\0${localDate}`, { channelId, localDate });
+  };
+  for (const row of db.prepare('SELECT channel_id, local_date FROM playlists WHERE tidal_playlist_id = ?').all(batch.target_id)) {
+    add(row.channel_id, row.local_date);
+  }
+  for (const playId of JSON.parse(batch.play_ids_json || '[]')) {
+    const play = db.prepare('SELECT channel_id, local_date FROM plays_legacy WHERE play_id = ?').get(playId);
+    if (play) add(play.channel_id, play.local_date);
+  }
+  if (batch.operation === 'create_playlist' && legacyChannelId && candidates.size === 0) {
+    const historicalChannelIds = new Set(db.prepare(`
+      SELECT channel_id FROM playlists
+      UNION SELECT channel_id FROM plays_legacy
+      UNION SELECT channel_id FROM sync_runs
+    `).all().map((row) => row.channel_id));
+    const match = batch.target_id.match(/ - (\d{4}-\d{2}-\d{2})$/);
+    if (match && historicalChannelIds.size === 1 && historicalChannelIds.has(legacyChannelId)) add(legacyChannelId, match[1]);
+  }
+  if (candidates.size !== 1) {
+    throw new Error(`Cannot safely assign active legacy write batch ${batch.id} to one channel and date.`);
+  }
+  return [...candidates.values()][0];
+}
 
 export class Database {
   constructor(path = 'data/xmsync.sqlite') {
@@ -138,8 +188,16 @@ export class Database {
     this.db = new DatabaseSync(path, { timeout: 5_000 });
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
     const version = this.db.prepare('PRAGMA user_version').get().user_version;
-    if (version > 1) throw new Error(`Database schema version ${version} is newer than this application supports.`);
-    if (version === 0) this.transaction(() => this.db.exec(MIGRATION));
+    if (version > LATEST_SCHEMA_VERSION) throw new Error(`Database schema version ${version} is newer than this application supports.`);
+    if (version === 0) this.transaction(() => this.db.exec(SCHEMA));
+    if (version === 1) {
+      try {
+        this.migrateVersion1();
+      } catch (error) {
+        this.db.close();
+        throw error;
+      }
+    }
   }
 
   close() {
@@ -158,6 +216,71 @@ export class Database {
     }
   }
 
+  migrateVersion1() {
+    this.transaction(() => {
+      this.db.exec(`
+        CREATE TABLE channels (
+          channel_id TEXT PRIMARY KEY, deeplink TEXT NOT NULL, display_name TEXT NOT NULL,
+          channel_number TEXT NOT NULL, playlist_label TEXT NOT NULL, selected_position INTEGER UNIQUE,
+          first_selected_at TEXT NOT NULL, last_updated_at TEXT NOT NULL
+        );
+      `);
+      const settings = this.settings();
+      const migratedAt = new Date().toISOString();
+      if (settings.channel_id) {
+        this.db.prepare(`INSERT INTO channels VALUES (?, ?, ?, ?, ?, 0, ?, ?)`).run(
+          settings.channel_id, settings.channel_deeplink, settings.channel_name, settings.channel_number,
+          settings.channel_name, migratedAt, migratedAt,
+        );
+      }
+
+      const duplicatePlaylist = this.db.prepare(`SELECT tidal_playlist_id FROM playlists GROUP BY tidal_playlist_id HAVING count(*) > 1 LIMIT 1`).get();
+      if (duplicatePlaylist) throw new Error(`TIDAL playlist ${duplicatePlaylist.tidal_playlist_id} is mapped to more than one channel/date.`);
+      this.db.exec('CREATE UNIQUE INDEX playlists_tidal_owner_idx ON playlists(tidal_playlist_id)');
+
+      this.db.exec('ALTER TABLE plays RENAME TO plays_legacy');
+      this.db.exec(`CREATE TABLE plays (
+        play_id TEXT NOT NULL, channel_id TEXT NOT NULL, airplay_at TEXT NOT NULL, local_date TEXT NOT NULL,
+        xm_track_id TEXT NOT NULL, title TEXT NOT NULL, artists_json TEXT NOT NULL, tidal_link TEXT,
+        tidal_track_id TEXT, match_method TEXT,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'synced', 'skipped', 'failed', 'recovered')),
+        playlist_id TEXT, occurrence_id TEXT, error_code TEXT, error_message TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (channel_id, play_id)
+      )`);
+      this.db.exec(`INSERT INTO plays SELECT play_id, channel_id, airplay_at, local_date, xm_track_id, title,
+        artists_json, tidal_link, tidal_track_id, match_method, status, playlist_id, occurrence_id,
+        error_code, error_message, created_at, updated_at FROM plays_legacy`);
+
+      this.db.exec('ALTER TABLE write_batches RENAME TO write_batches_legacy');
+      this.db.exec(`CREATE TABLE write_batches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id TEXT, local_date TEXT, operation TEXT NOT NULL,
+        target_id TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, payload TEXT NOT NULL,
+        payload_hash TEXT NOT NULL, play_ids_json TEXT NOT NULL, precondition_json TEXT,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'ambiguous')), created_at TEXT NOT NULL,
+        attempted_at TEXT, completed_at TEXT, response_json TEXT,
+        CHECK (status = 'completed' OR (channel_id IS NOT NULL AND local_date IS NOT NULL))
+      )`);
+      const batches = this.db.prepare('SELECT * FROM write_batches_legacy ORDER BY id').all();
+      const insertBatch = this.db.prepare(`INSERT INTO write_batches
+        (id, channel_id, local_date, operation, target_id, idempotency_key, payload, payload_hash,
+         play_ids_json, precondition_json, status, created_at, attempted_at, completed_at, response_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      for (const batch of batches) {
+        const owner = batch.status === 'completed' ? null : inferLegacyBatchOwner(this.db, batch, settings.channel_id);
+        insertBatch.run(batch.id, owner?.channelId ?? null, owner?.localDate ?? null, batch.operation,
+          batch.target_id, batch.idempotency_key, batch.payload, batch.payload_hash, batch.play_ids_json,
+          batch.precondition_json, batch.status, batch.created_at, batch.attempted_at, batch.completed_at, batch.response_json);
+      }
+
+      const runColumns = tableColumns(this.db, 'sync_runs');
+      if (!runColumns.has('channel_number')) this.db.exec('ALTER TABLE sync_runs ADD COLUMN channel_number TEXT');
+      if (!runColumns.has('recovered')) this.db.exec('ALTER TABLE sync_runs ADD COLUMN recovered INTEGER NOT NULL DEFAULT 0');
+      this.db.exec(`DROP TABLE write_batches_legacy; DROP TABLE plays_legacy;
+        CREATE INDEX plays_process_idx ON plays(channel_id, status, airplay_at);
+        PRAGMA user_version = 2;`);
+    });
+  }
+
   settings() {
     return this.db.prepare('SELECT * FROM settings WHERE id = 1').get();
   }
@@ -166,9 +289,41 @@ export class Database {
     this.db.prepare('UPDATE settings SET tidal_client_id = ?, tidal_client_secret = ? WHERE id = 1').run(clientId, clientSecret);
   }
 
-  saveChannel(channel) {
-    this.db.prepare(`UPDATE settings SET channel_id = ?, channel_deeplink = ?, channel_name = ?, channel_number = ? WHERE id = 1`)
-      .run(channel.id, channel.deeplink.toLowerCase(), channel.name, String(channel.number));
+  selectedChannels() {
+    return this.db.prepare(`SELECT channel_id id, deeplink, display_name name, channel_number number,
+      playlist_label playlistLabel, selected_position selectedPosition
+      FROM channels WHERE selected_position IS NOT NULL ORDER BY selected_position`).all();
+  }
+
+  persistedChannels() {
+    return this.db.prepare(`SELECT channel_id id, deeplink, display_name name, channel_number number,
+      playlist_label playlistLabel, selected_position selectedPosition
+      FROM channels ORDER BY selected_position IS NULL, selected_position, display_name`).all();
+  }
+
+  replaceSelectedChannels(channels, timestamp = new Date().toISOString()) {
+    if (channels.length > 10) throw new Error('No more than ten channels may be selected.');
+    if (new Set(channels.map((channel) => channel.id)).size !== channels.length) throw new Error('Duplicate channel IDs are not allowed.');
+    return this.transaction(() => {
+      const previous = this.selectedChannels();
+      this.db.prepare('UPDATE channels SET selected_position = NULL').run();
+      const upsert = this.db.prepare(`INSERT INTO channels
+        (channel_id, deeplink, display_name, channel_number, playlist_label, selected_position, first_selected_at, last_updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(channel_id) DO UPDATE SET deeplink=excluded.deeplink, display_name=excluded.display_name,
+          channel_number=excluded.channel_number, selected_position=excluded.selected_position, last_updated_at=excluded.last_updated_at`);
+      channels.forEach((channel, position) => upsert.run(channel.id, channel.deeplink.toLowerCase(), channel.name,
+        String(channel.number), channel.playlistLabel, position, timestamp, timestamp));
+      if (channels.length === 0) this.setSchedulerEnabled(false);
+      const selected = this.selectedChannels();
+      const previousIds = new Set(previous.map((channel) => channel.id));
+      const nextIds = new Set(selected.map((channel) => channel.id));
+      return {
+        selected,
+        added: selected.filter((channel) => !previousIds.has(channel.id)),
+        removed: previous.filter((channel) => !nextIds.has(channel.id)),
+      };
+    });
   }
 
   setSchedulerEnabled(enabled) {
@@ -236,19 +391,23 @@ export class Database {
       WHERE p.channel_id = ? AND p.status IN ('pending', 'failed')
       AND NOT EXISTS (
         SELECT 1 FROM write_batches wb, json_each(wb.play_ids_json) ids
-        WHERE wb.status = 'ambiguous' AND ids.value = p.play_id
+        WHERE wb.status = 'ambiguous' AND wb.channel_id = p.channel_id AND ids.value = p.play_id
       )
       ORDER BY p.airplay_at, p.play_id`).all(channelId);
   }
 
-  setPlayResolved(playId, trackId, method, timestamp) {
-    this.db.prepare(`UPDATE plays SET tidal_track_id=?, match_method=?, status='pending', error_code=NULL, error_message=NULL, updated_at=? WHERE play_id=?`)
-      .run(trackId, method, timestamp, playId);
+  play(channelId, playId) {
+    return this.db.prepare('SELECT * FROM plays WHERE channel_id=? AND play_id=?').get(channelId, playId);
   }
 
-  setPlayOutcome(playId, status, fields, timestamp) {
-    this.db.prepare(`UPDATE plays SET status=?, playlist_id=?, occurrence_id=?, error_code=?, error_message=?, updated_at=? WHERE play_id=?`)
-      .run(status, fields.playlistId ?? null, fields.occurrenceId ?? null, fields.errorCode ?? null, fields.errorMessage ?? null, timestamp, playId);
+  setPlayResolved(channelId, playId, trackId, method, timestamp) {
+    this.db.prepare(`UPDATE plays SET tidal_track_id=?, match_method=?, status='pending', error_code=NULL, error_message=NULL, updated_at=? WHERE channel_id=? AND play_id=?`)
+      .run(trackId, method, timestamp, channelId, playId);
+  }
+
+  setPlayOutcome(channelId, playId, status, fields, timestamp) {
+    this.db.prepare(`UPDATE plays SET status=?, playlist_id=?, occurrence_id=?, error_code=?, error_message=?, updated_at=? WHERE channel_id=? AND play_id=?`)
+      .run(status, fields.playlistId ?? null, fields.occurrenceId ?? null, fields.errorCode ?? null, fields.errorMessage ?? null, timestamp, channelId, playId);
   }
 
   mapping(trackId, sourceIdentity) {
@@ -268,6 +427,10 @@ export class Database {
     return this.db.prepare('SELECT * FROM playlists WHERE channel_id = ? AND local_date = ?').get(channelId, localDate);
   }
 
+  playlistOwner(playlistId) {
+    return this.db.prepare('SELECT channel_id, local_date FROM playlists WHERE tidal_playlist_id = ?').get(playlistId);
+  }
+
   savePlaylist(mapping) {
     this.db.prepare(`INSERT INTO playlists
       (channel_id, local_date, expected_name, tidal_playlist_id, source, created_at, last_seen_at)
@@ -282,8 +445,8 @@ export class Database {
   }
 
   createRun(trigger, channel, startedAt) {
-    return Number(this.db.prepare(`INSERT INTO sync_runs (trigger, channel_id, channel_name, started_at, status) VALUES (?, ?, ?, ?, 'running')`)
-      .run(trigger, channel.id, channel.name, startedAt).lastInsertRowid);
+    return Number(this.db.prepare(`INSERT INTO sync_runs (trigger, channel_id, channel_name, channel_number, started_at, status) VALUES (?, ?, ?, ?, ?, 'running')`)
+      .run(trigger, channel.id, channel.name, channel.number, startedAt).lastInsertRowid);
   }
 
   finishRun(runId, status, counts, endedAt, errorMessage = null) {
@@ -301,8 +464,10 @@ export class Database {
         item.artist ?? null, item.title ?? null, item.errorCode ?? null, item.errorMessage ?? null);
   }
 
-  recentRuns(limit = 20) {
-    return this.db.prepare('SELECT * FROM sync_runs ORDER BY id DESC LIMIT ?').all(limit);
+  recentRuns(limit = 20, channelId = null) {
+    return channelId
+      ? this.db.prepare('SELECT * FROM sync_runs WHERE channel_id=? ORDER BY id DESC LIMIT ?').all(channelId, limit)
+      : this.db.prepare('SELECT * FROM sync_runs ORDER BY id DESC LIMIT ?').all(limit);
   }
 
   runItems(runId) {
@@ -313,21 +478,27 @@ export class Database {
     return this.db.prepare('SELECT * FROM sync_runs WHERE status != ? ORDER BY id DESC LIMIT 1').get('running');
   }
 
-  findPendingBatch(operation, targetId, payloadHash, playIds = []) {
-    return this.db.prepare(`SELECT * FROM write_batches
-      WHERE operation=? AND target_id=? AND payload_hash=? AND play_ids_json=? AND status='pending'
-      ORDER BY id DESC LIMIT 1`).get(operation, targetId, payloadHash, JSON.stringify(playIds));
+  latestRunsByChannel() {
+    return this.db.prepare(`SELECT r.* FROM sync_runs r
+      JOIN (SELECT channel_id, max(id) id FROM sync_runs WHERE status != 'running' GROUP BY channel_id) latest ON latest.id=r.id
+      ORDER BY r.id DESC`).all();
   }
 
-  pendingAddBatches() {
-    return this.db.prepare(`SELECT * FROM write_batches WHERE operation='add_items' AND status='pending' ORDER BY id`).all();
+  findPendingBatch(channelId, localDate, operation, targetId, payloadHash, playIds = []) {
+    return this.db.prepare(`SELECT * FROM write_batches
+      WHERE channel_id=? AND local_date=? AND operation=? AND target_id=? AND payload_hash=? AND play_ids_json=? AND status='pending'
+      ORDER BY id DESC LIMIT 1`).get(channelId, localDate, operation, targetId, payloadHash, JSON.stringify(playIds));
+  }
+
+  pendingAddBatches(channelId) {
+    return this.db.prepare(`SELECT * FROM write_batches WHERE channel_id=? AND operation='add_items' AND status='pending' ORDER BY id`).all(channelId);
   }
 
   createBatch(batch) {
     return Number(this.db.prepare(`INSERT INTO write_batches
-      (operation, target_id, idempotency_key, payload, payload_hash, play_ids_json, precondition_json, status, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`)
-      .run(batch.operation, batch.targetId, batch.idempotencyKey, batch.payload, batch.payloadHash,
+      (channel_id, local_date, operation, target_id, idempotency_key, payload, payload_hash, play_ids_json, precondition_json, status, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`)
+      .run(batch.channelId, batch.localDate, batch.operation, batch.targetId, batch.idempotencyKey, batch.payload, batch.payloadHash,
         JSON.stringify(batch.playIds ?? []), batch.precondition ? JSON.stringify(batch.precondition) : null, batch.createdAt).lastInsertRowid);
   }
 

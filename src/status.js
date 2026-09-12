@@ -7,6 +7,7 @@ function mapRun(row) {
     trigger: row.trigger,
     channelId: row.channel_id,
     channelName: row.channel_name,
+    channelNumber: row.channel_number,
     startedAt: row.started_at,
     endedAt: row.ended_at,
     status: row.status,
@@ -37,7 +38,9 @@ export function statusView(database, coordinator, scheduler) {
   const settings = database.settings();
   const tokens = database.tokens();
   const latest = mapRun(database.latestRun());
-  const schedulerState = coordinator.active ? 'syncing' : coordinator.lastError ? 'error' : settings.scheduler_enabled ? 'running' : 'stopped';
+  const selectedChannels = database.selectedChannels();
+  const hasErrors = coordinator.accountError || coordinator.errors?.size;
+  const schedulerState = coordinator.active ? 'syncing' : hasErrors ? 'error' : settings.scheduler_enabled && selectedChannels.length ? 'running' : 'stopped';
   return {
     configured: Boolean(settings.tidal_client_id && settings.tidal_client_secret),
     auth: {
@@ -47,26 +50,24 @@ export function statusView(database, coordinator, scheduler) {
       expiresAt: tokens?.expires_at ?? null,
       reauthorizationRequired: !tokens && Boolean(settings.account_user_id),
     },
-    channel: settings.channel_id ? {
-      id: settings.channel_id,
-      deeplink: settings.channel_deeplink,
-      name: settings.channel_name,
-      number: settings.channel_number,
-    } : null,
+    selectedChannels,
     scheduler: {
       enabled: Boolean(settings.scheduler_enabled),
       state: schedulerState,
-      current: coordinator.current,
-      queued: coordinator.queued,
+      current: coordinator.currentView?.() ?? coordinator.current,
+      queued: coordinator.queuedView?.() ?? coordinator.queued ?? [],
       nextRunAt: scheduler.nextRunAt?.toISOString() ?? null,
-      error: coordinator.lastError?.message ?? null,
+      errors: [coordinator.accountError ? { scope: 'account', ...coordinator.accountError } : null,
+        ...[...(coordinator.errors?.values?.() ?? [])].map((error) => ({ scope: 'channel', ...error }))].filter(Boolean),
+      lastSweep: coordinator.publicLastSweep?.() ?? null,
     },
     lastRun: latest,
+    recentByChannel: database.latestRunsByChannel().map(mapRun),
   };
 }
 
-export function runsView(database) {
-  return database.recentRuns().map((row) => ({
+export function runsView(database, options = {}) {
+  return database.recentRuns(options.limit ?? 20, options.channelId ?? null).map((row) => ({
     ...mapRun(row),
     details: database.runItems(row.id).map((item) => ({
       id: item.id,

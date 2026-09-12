@@ -22,7 +22,7 @@ function databaseWithUser() {
 
 test('completed batches allow identical track payloads for different airplay IDs', () => {
   const database = databaseWithUser();
-  const common = { operation: 'add_items', targetId: 'playlist', payload: '{"same":true}', payloadHash: 'hash', createdAt: new Date().toISOString() };
+  const common = { channelId: 'station', localDate: '2026-09-11', operation: 'add_items', targetId: 'playlist', payload: '{"same":true}', payloadHash: 'hash', createdAt: new Date().toISOString() };
   const first = database.createBatch({ ...common, idempotencyKey: 'key-1', playIds: ['play-1'] });
   database.completeBatch(first, {}, new Date().toISOString());
   const second = database.createBatch({ ...common, idempotencyKey: 'key-2', playIds: ['play-2'] });

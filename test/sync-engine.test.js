@@ -122,3 +122,24 @@ test('an exhausted TIDAL rate limit stops resolution of later historical plays',
   assert.deepEqual(database.db.prepare('SELECT status FROM plays ORDER BY airplay_at').all().map((row) => row.status), ['failed', 'pending']);
   database.close();
 });
+
+test('two channels independently sync the same raw play ID using stable playlist labels', async () => {
+  const database = new Database(':memory:');
+  database.saveTokens({
+    userId: 'user', accessToken: 'a', refreshToken: 'r', tokenType: 'Bearer', scopes: [],
+    expiresAt: '2099-01-01T00:00:00.000Z', updatedAt: '2026-09-11T00:00:00.000Z',
+  });
+  const xm = { async page() { return { results: [rawPlay('shared', '2026-09-11T12:00:00.000Z')], next: null }; } };
+  const tidal = makeTidal();
+  tidal.createPlaylist = async (name) => ({ data: { id: name.includes('Ch. 1') ? 'playlist-1' : 'playlist-2' } });
+  const engine = new SyncEngine(database, xm, tidal, { clock: () => new Date('2026-09-11T13:00:00.000Z') });
+  const first = { id: 'one', deeplink: 'one', name: 'Blend', number: '1', playlistLabel: 'Blend (Ch. 1)' };
+  const second = { id: 'two', deeplink: 'two', name: 'Blend', number: '2', playlistLabel: 'Blend (Ch. 2)' };
+  assert.equal((await engine.run('manual', first)).counts.synced, 1);
+  assert.equal((await engine.run('manual', second)).counts.synced, 1);
+  assert.equal(database.db.prepare("SELECT count(*) count FROM plays WHERE play_id='shared' AND status='synced'").get().count, 2);
+  assert.deepEqual(database.db.prepare('SELECT expected_name FROM playlists ORDER BY channel_id').all().map((row) => row.expected_name), [
+    'Blend (Ch. 1) - 2026-09-11', 'Blend (Ch. 2) - 2026-09-11',
+  ]);
+  database.close();
+});
